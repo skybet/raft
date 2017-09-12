@@ -376,7 +376,12 @@ func (n *NetworkTransport) InstallSnapshot(id ServerID, target ServerAddress, ar
 
 	// Set a deadline, scaled by request size
 	if n.timeout > 0 {
-		timeout := n.timeout * time.Duration(args.Size/int64(n.TimeoutScale))
+		transferSize := args.EstimatedSize
+		if args.Size > 0 {
+			transferSize = args.Size
+		}
+
+		timeout := n.timeout * time.Duration(transferSize/int64(n.TimeoutScale))
 		if timeout < n.timeout {
 			timeout = n.timeout
 		}
