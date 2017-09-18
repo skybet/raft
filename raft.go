@@ -754,7 +754,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot: %v", err)
 	}
-	if n != meta.Size {
+	if n != meta.Size && meta.Size != -1 {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot, size didn't match (%d != %d)", n, meta.Size)
 	}
