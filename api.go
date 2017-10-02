@@ -996,7 +996,7 @@ type ReplicationStat struct {
 }
 
 func (r *Raft) ReplicationStats() (map[ServerID]ReplicationStat, error) {
-	if r.getState() == Leader {
+	if r.getState() != Leader {
 		return nil, ErrNotLeader
 	}
 	stats := make(map[ServerID]ReplicationStat)
