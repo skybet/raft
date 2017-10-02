@@ -990,6 +990,29 @@ func (r *Raft) Stats() map[string]string {
 	return s
 }
 
+type ReplicationStat struct {
+	LastContact time.Duration
+	NextIndex   uint64
+}
+
+func (r *Raft) ReplicationStats() (map[ServerID]ReplicationStat, error) {
+	if r.getState() == Leader {
+		return nil, ErrNotLeader
+	}
+	stats := make(map[ServerID]ReplicationStat)
+	for k, v := range r.leaderState.replState {
+		if v == nil {
+			continue
+		}
+		stats[k] = ReplicationStat{
+			LastContact: time.Since(v.LastContact()),
+			NextIndex:   v.nextIndex,
+		}
+	}
+
+	return stats, nil
+}
+
 // LastIndex returns the last index in stable storage,
 // either from the last log or from the last snapshot.
 func (r *Raft) LastIndex() uint64 {
