@@ -754,7 +754,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot: %v", err)
 	}
-	if n != meta.Size {
+	if n != meta.Size && meta.Size != -1 {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot, size didn't match (%d != %d)", n, meta.Size)
 	}
@@ -839,6 +839,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	lastIndex := r.getLastIndex()
 	logs := make([]*Log, len(applyLogs))
 
+	startAddInflight := time.Now()
 	for idx, applyLog := range applyLogs {
 		applyLog.dispatch = now
 		lastIndex++
@@ -847,7 +848,9 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		logs[idx] = &applyLog.log
 		r.leaderState.inflight.PushBack(applyLog)
 	}
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "AddInflight"}, startAddInflight)
 
+	startStoreLog := time.Now()
 	// Write the log entry locally
 	if err := r.logs.StoreLogs(logs); err != nil {
 		r.logger.Printf("[ERR] raft: Failed to commit logs: %v", err)
@@ -857,7 +860,11 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		r.setState(Follower)
 		return
 	}
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "StoreLogs"}, startStoreLog)
+
+	startCommitmentMatch := time.Now()
 	r.leaderState.commitment.match(r.localID, lastIndex)
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "commitmentMatch"}, startCommitmentMatch)
 
 	// Update the last log since it's on disk now
 	r.setLastLog(lastIndex, term)
@@ -1296,7 +1303,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}
 
 	// Check that we received it all
-	if n != req.Size {
+	if req.Size != -1 && n != req.Size {
 		sink.Cancel()
 		r.logger.Printf("[ERR] raft: Failed to receive whole snapshot: %d / %d", n, req.Size)
 		rpcErr = fmt.Errorf("short read")
