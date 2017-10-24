@@ -373,7 +373,7 @@ func (r *Raft) sendShutdown(s *followerReplication) {
 		Term:      s.currentTerm,
 		Leader:    r.trans.EncodePeer("", ""),
 	}
-	fmt.Println("sending shutdown signal")
+	r.logger.Printf("[INFO] raft: Notifying %v that we are shutting down", s.peer.Address)
 	var resp AppendEntriesResponse
 	start := time.Now()
 	if err := r.trans.AppendEntries(s.peer.ID, s.peer.Address, &req, &resp); err != nil {
