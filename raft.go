@@ -1116,7 +1116,9 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}
 
 	// Ensure transition to follower
-	r.setState(Follower)
+	if r.getState() != Follower {
+		r.setState(Follower)
+	}
 
 	// Save the current leader
 	r.setLeader(ServerAddress(r.trans.DecodePeer(a.Leader)))
@@ -1274,6 +1276,35 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 
+	candidate := r.trans.DecodePeer(req.Candidate)
+
+	// Don't accept voting requests from unknown or non voting servers if
+	// there's an active configuration with more than 0 servers. If the
+	// configuration has 0 servers this node should help bootstrapping a
+	// cluster.
+	if len(r.configurations.latest.Servers) > 0 {
+		var candidateServer *Server
+		for _, server := range r.configurations.latest.Servers {
+			if server.Address == candidate {
+				candidateServer = &server
+				break
+			}
+		}
+
+		// If the candidate is not part of the latest configuration ignore its
+		// voting request
+		if candidateServer == nil {
+			r.logger.Printf("[WARN] raft: Rejecting vote request from %v, since it'not part of the configuration", candidate)
+			return
+		}
+
+		// If the candidate is not a voter, ignore its voting request
+		if candidateServer.Suffrage != Voter {
+			r.logger.Printf("[WARN] raft: Rejecting vote request from %v, since it's a non voting server", candidate)
+			return
+		}
+	}
+
 	// Increase the term if we see a newer one
 	if req.Term > r.getCurrentTerm() {
 		// Ensure transition to follower
@@ -1293,8 +1324,6 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		r.logger.Printf("[ERR] raft: Failed to get last vote candidate: %v", err)
 		return
 	}
-
-	candidate := r.trans.DecodePeer(req.Candidate)
 
 	// Check if we've voted in this election before
 	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
