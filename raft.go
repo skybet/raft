@@ -703,9 +703,6 @@ func (r *Raft) leaderLoop() {
 			lease = time.After(checkInterval)
 
 		case <-r.shutdownCh:
-			for _, replState := range r.leaderState.replState {
-				r.sendShutdown(replState)
-			}
 			return
 		}
 	}
@@ -1120,12 +1117,19 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.setState(Follower)
 	}
 
-	// Save the current leader
-	r.setLeader(ServerAddress(r.trans.DecodePeer(a.Leader)))
+	leader := r.trans.DecodePeer(a.Leader)
+	if r.Leader() != leader {
+		// Save the current leader
+		r.logger.Printf("[INFO] raft: Changing leader from %q to %q", r.Leader(), leader)
+		r.setLeader(leader)
+	}
 	// If leader got unset by appendEntries it was a shutdown signal from the
 	// leader
 	if r.Leader() == "" {
 		r.logger.Printf("[INFO] raft: Leader has shut down")
+		// Increment current term, so queued appendEntries from leader that is
+		// shutting down are ignored.
+		r.setCurrentTerm(a.Term + 1)
 		return
 	}
 

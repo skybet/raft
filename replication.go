@@ -347,6 +347,9 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 		case <-stopCh:
 			return
 		}
+		if r.getShuttingDown() {
+			return
+		}
 
 		start := time.Now()
 		if err := r.trans.AppendEntries(s.peer.ID, s.peer.Address, &req, &resp); err != nil {
@@ -365,7 +368,7 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 	}
 }
 
-// shutdown is used to signal the followers that the leader is shutting down.
+// sendShutdown is used to signal the followers that the leader is shutting down.
 // This way they don't have to wait for HeartbeatTimeout to start an election.
 func (r *Raft) sendShutdown(s *followerReplication) {
 	req := AppendEntriesRequest{
@@ -379,6 +382,7 @@ func (r *Raft) sendShutdown(s *followerReplication) {
 	if err := r.trans.AppendEntries(s.peer.ID, s.peer.Address, &req, &resp); err != nil {
 		r.logger.Printf("[ERR] raft: Failed to notify to %v that this node is shutting down: %v", s.peer.Address, err)
 	} else {
+		r.logger.Printf("[INFO] raft: Successfully notified %v that this node is shutting down", s.peer.Address)
 		s.setLastContact()
 		metrics.MeasureSince([]string{"raft", "replication", "shutdown", string(s.peer.ID)}, start)
 	}
