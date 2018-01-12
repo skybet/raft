@@ -1019,3 +1019,15 @@ func (r *Raft) PeersLostContact(du time.Duration) []ServerID {
 	}
 	return ids
 }
+
+// LatestConfigIndex returns the latest configuration index
+func (r *Raft) LatestConfigIndex() (lastConfigIndex uint64, err error) {
+	future := r.GetConfiguration()
+	if err = future.Error(); err != nil {
+		r.logger.Printf("[WARN] raft: could not get configuration for Stats: %v", err)
+		return
+	} else {
+		lastConfigIndex = future.Index()
+	}
+	return
+}
