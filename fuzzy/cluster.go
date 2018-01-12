@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/raft"
+	"github.com/weimingwill/raft"
 )
 
 type appliedItem struct {
