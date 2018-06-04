@@ -10,8 +10,7 @@ import (
 )
 
 const (
-	maxFailureScale = 12
-	failureWait     = 10 * time.Millisecond
+	failureWait = 10 * time.Millisecond
 )
 
 var (
@@ -169,7 +168,7 @@ START:
 	// Prevent an excessive retry rate on errors
 	if s.failures > 0 {
 		select {
-		case <-time.After(backoff(failureWait, s.failures, maxFailureScale)):
+		case <-time.After(backoff(failureWait, r.conf.MaximumBackoff, s.failures)):
 		case <-r.shutdownCh:
 		}
 	}
@@ -283,6 +282,7 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 		LastLogTerm:        meta.Term,
 		Peers:              meta.Peers,
 		Size:               meta.Size,
+		EstimatedSize:      meta.EstimatedSize,
 		Configuration:      encodeConfiguration(meta.Configuration),
 		ConfigurationIndex: meta.ConfigurationIndex,
 	}
@@ -337,10 +337,17 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 	var resp AppendEntriesResponse
 	for {
 		// Wait for the next heartbeat interval or forced notify
+		interval := r.conf.HeartbeatInterval
+		if interval == 0 {
+			interval = r.conf.HeartbeatInterval / 10
+		}
 		select {
 		case <-s.notifyCh:
-		case <-randomTimeout(r.conf.HeartbeatTimeout / 10):
+		case <-time.After(interval):
 		case <-stopCh:
+			return
+		}
+		if r.getShuttingDown() {
 			return
 		}
 
@@ -349,7 +356,7 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			r.logger.Printf("[ERR] raft: Failed to heartbeat to %v: %v", s.peer.Address, err)
 			failures++
 			select {
-			case <-time.After(backoff(failureWait, failures, maxFailureScale)):
+			case <-time.After(backoff(failureWait, r.conf.MaximumBackoff, failures)):
 			case <-stopCh:
 			}
 		} else {
@@ -358,6 +365,26 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			metrics.MeasureSince([]string{"raft", "replication", "heartbeat", string(s.peer.ID)}, start)
 			s.notifyAll(resp.Success)
 		}
+	}
+}
+
+// sendShutdown is used to signal the followers that the leader is shutting down.
+// This way they don't have to wait for HeartbeatTimeout to start an election.
+func (r *Raft) sendShutdown(s *followerReplication) {
+	req := AppendEntriesRequest{
+		RPCHeader: r.getRPCHeader(),
+		Term:      s.currentTerm,
+		Leader:    r.trans.EncodePeer("", ""),
+	}
+	r.logger.Printf("[INFO] raft: Notifying %v that this node is shutting down", s.peer.Address)
+	var resp AppendEntriesResponse
+	start := time.Now()
+	if err := r.trans.AppendEntries(s.peer.ID, s.peer.Address, &req, &resp); err != nil {
+		r.logger.Printf("[ERR] raft: Failed to notify to %v that this node is shutting down: %v", s.peer.Address, err)
+	} else {
+		r.logger.Printf("[INFO] raft: Successfully notified %v that this node is shutting down", s.peer.Address)
+		s.setLastContact()
+		metrics.MeasureSince([]string{"raft", "replication", "shutdown", string(s.peer.ID)}, start)
 	}
 }
 

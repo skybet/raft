@@ -130,6 +130,11 @@ type Config struct {
 	// a leader before we attempt an election.
 	HeartbeatTimeout time.Duration
 
+	// HeartbeatInterval specifies the interval at which heartbeats should be
+	// sent to a follower. If this is set to 0 the interval will default to
+	// HeartbeatTimeout / 10.
+	HeartbeatInterval time.Duration
+
 	// ElectionTimeout specifies the time in candidate state without
 	// a leader before we attempt an election.
 	ElectionTimeout time.Duration
@@ -138,6 +143,12 @@ type Config struct {
 	// before we heartbeat to ensure a timely commit. Due to random
 	// staggering, may be delayed as much as 2x this value.
 	CommitTimeout time.Duration
+
+	// MaximumBackoff specifies the maximum time between heartbeats from the
+	// leader to a follower when the follower is considered down by the leader.
+	// Nodes that just started will wait twice this time before starting an
+	// election to give the current leader time to contact them.
+	MaximumBackoff time.Duration
 
 	// MaxAppendEntries controls the maximum number of append entries
 	// to send at once. We want to strike a balance between efficiency
@@ -201,6 +212,7 @@ func DefaultConfig() *Config {
 		ProtocolVersion:    ProtocolVersionMax,
 		HeartbeatTimeout:   1000 * time.Millisecond,
 		ElectionTimeout:    1000 * time.Millisecond,
+		MaximumBackoff:     5 * time.Second,
 		CommitTimeout:      50 * time.Millisecond,
 		MaxAppendEntries:   64,
 		ShutdownOnRemove:   true,
@@ -251,8 +263,8 @@ func ValidateConfig(config *Config) error {
 	if config.LeaderLeaseTimeout > config.HeartbeatTimeout {
 		return fmt.Errorf("Leader lease timeout cannot be larger than heartbeat timeout")
 	}
-	if config.ElectionTimeout < config.HeartbeatTimeout {
-		return fmt.Errorf("Election timeout must be equal or greater than Heartbeat Timeout")
+	if config.HeartbeatTimeout < config.HeartbeatInterval*2 {
+		return fmt.Errorf("Heartbeat timeout should be at least twice as large as the heartbeat interval")
 	}
 	return nil
 }

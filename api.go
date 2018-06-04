@@ -123,6 +123,11 @@ type Raft struct {
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 
+	// Shutting down boolean to check if raft is shutting down, protected by a
+	// mutex.
+	shuttingDownLock sync.Mutex
+	shuttingDown     bool
+
 	// snapshots is used to store and retrieve snapshots
 	snapshots SnapshotStore
 
@@ -156,6 +161,11 @@ type Raft struct {
 	// is indexed by an artificial ID which is used for deregistration.
 	observersLock sync.RWMutex
 	observers     map[uint64]*Observer
+
+	// startedAt is used to store the time at which raft started running.
+	startedAt time.Time
+	// receivedRequestVote stores if the node has received a request to vote.
+	receivedRequestVote bool
 }
 
 // BootstrapCluster initializes a server's storage with the given cluster
@@ -787,14 +797,29 @@ func (r *Raft) DemoteVoter(id ServerID, prevIndex uint64, timeout time.Duration)
 	}, timeout)
 }
 
-// Shutdown is used to stop the Raft background routines.
-// This is not a graceful operation. Provides a future that
+// Shutdown is used to stop the Raft background routines. If the node is the
+// leader it will signal the followers that it is shutting down. This way the
+// followers will start an immediate election. Provides a future that
 // can be used to block until all background routines have exited.
 func (r *Raft) Shutdown() Future {
 	r.shutdownLock.Lock()
 	defer r.shutdownLock.Unlock()
 
 	if !r.shutdown {
+		r.setShuttingDown()
+		if r.getState() == Leader {
+			r.logger.Println("[INFO] raft: Notifying followers that node is shutting down")
+			var group sync.WaitGroup
+			for _, replState := range r.leaderState.replState {
+				replStateReal := replState
+				group.Add(1)
+				go func() {
+					defer group.Done()
+					r.sendShutdown(replStateReal)
+				}()
+			}
+			group.Wait()
+		}
 		close(r.shutdownCh)
 		r.shutdown = true
 		r.setState(Shutdown)
@@ -988,6 +1013,29 @@ func (r *Raft) Stats() map[string]string {
 		s["last_contact"] = fmt.Sprintf("%v", time.Now().Sub(last))
 	}
 	return s
+}
+
+type ReplicationStat struct {
+	LastContact time.Duration
+	NextIndex   uint64
+}
+
+func (r *Raft) ReplicationStats() (map[ServerID]ReplicationStat, error) {
+	if r.getState() != Leader {
+		return nil, ErrNotLeader
+	}
+	stats := make(map[ServerID]ReplicationStat)
+	for k, v := range r.leaderState.replState {
+		if v == nil {
+			continue
+		}
+		stats[k] = ReplicationStat{
+			LastContact: time.Since(v.LastContact()),
+			NextIndex:   v.nextIndex,
+		}
+	}
+
+	return stats, nil
 }
 
 // LastIndex returns the last index in stable storage,

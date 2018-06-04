@@ -96,6 +96,21 @@ func (r *Raft) setLeader(leader ServerAddress) {
 	}
 }
 
+// getShuttingDown is used to check if raft is in the process of shutting down
+func (r *Raft) getShuttingDown() bool {
+	r.shuttingDownLock.Lock()
+	shuttingDown := r.shuttingDown
+	r.shuttingDownLock.Unlock()
+	return shuttingDown
+}
+
+// setShuttingDown is used to make getShuttingDown return true after the call
+func (r *Raft) setShuttingDown() {
+	r.shuttingDownLock.Lock()
+	r.shuttingDown = true
+	r.shuttingDownLock.Unlock()
+}
+
 // requestConfigChange is a helper for the above functions that make
 // configuration change requests. 'req' describes the change. For timeout,
 // see AddVoter.
@@ -120,6 +135,7 @@ func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.
 
 // run is a long running goroutine that runs the Raft FSM.
 func (r *Raft) run() {
+	r.startedAt = time.Now()
 	for {
 		// Check if we are doing a shutdown
 		select {
@@ -148,6 +164,8 @@ func (r *Raft) runFollower() {
 	r.logger.Printf("[INFO] raft: %v entering Follower state (Leader: %q)", r, r.Leader())
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
 	heartbeatTimer := randomTimeout(r.conf.HeartbeatTimeout)
+	electionTimer := randomTimeout(r.conf.ElectionTimeout)
+
 	for {
 		select {
 		case rpc := <-r.rpcCh:
@@ -176,6 +194,20 @@ func (r *Raft) runFollower() {
 		case b := <-r.bootstrapCh:
 			b.respond(r.liveBootstrap(b.configuration))
 
+		case <-electionTimer:
+			electionTimer = randomTimeout(r.conf.ElectionTimeout)
+			if r.configurations.latestIndex == 0 {
+				if !didWarn {
+					r.logger.Printf("[WARN] raft: no known peers, aborting election")
+					didWarn = true
+				}
+			} else if r.canStartElection() {
+				r.logger.Printf(`[WARN] raft: Election timeout reached while having no leader, starting election`)
+				metrics.IncrCounter([]string{"raft", "transition", "election_timeout"}, 1)
+				r.setState(Candidate)
+				return
+			}
+
 		case <-heartbeatTimer:
 			// Restart the heartbeat timer
 			heartbeatTimer = randomTimeout(r.conf.HeartbeatTimeout)
@@ -201,7 +233,7 @@ func (r *Raft) runFollower() {
 					r.logger.Printf("[WARN] raft: not part of stable configuration, aborting election")
 					didWarn = true
 				}
-			} else {
+			} else if r.canStartElection() {
 				r.logger.Printf(`[WARN] raft: Heartbeat timeout from %q reached, starting election`, lastLeader)
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				r.setState(Candidate)
@@ -212,6 +244,67 @@ func (r *Raft) runFollower() {
 			return
 		}
 	}
+}
+
+// canStartElection is used to determine if a election can be started by this
+// node. The main things to check here are:
+// - Does the node already know a leader?
+// - Is the node shutting down?
+// - Is the node part of the last cluster configuration?
+// - Is the node a voter in the last cluster configuration?
+// - Has the node given the current leader enough time to contact it after
+//   being down?
+func (r *Raft) canStartElection() bool {
+	if r.Leader() != "" {
+		return false
+	}
+
+	// Don't start an election when the node is busy shutting down
+	if r.getShuttingDown() {
+		return false
+	}
+
+	var thisServer *Server
+	for _, server := range r.configurations.latest.Servers {
+		if server.ID == r.localID {
+			thisServer = &server
+			break
+		}
+	}
+
+	// If the node is not part of the cluster configuration it cannot start an election
+	if thisServer == nil {
+		return false
+	}
+
+	// If the node is not a voter it cannot start an election
+	if thisServer.Suffrage != Voter {
+		return false
+	}
+
+	// Has there been enough time since startup for a current leader to contact
+	// this node.
+	if time.Since(r.startedAt) > 2*r.conf.MaximumBackoff {
+		return true
+	}
+
+	// If the server is the only leader it doesn't have to wait for contact
+	if len(r.configurations.latest.Servers) == 1 {
+		return true
+	}
+
+	// If server has already been in contact with a leader it doesn't have to
+	// wait longer
+	if !r.LastContact().IsZero() {
+		return true
+	}
+
+	// if the node has received a request to vote it is allowed to send those
+	// as well.
+	if r.receivedRequestVote {
+		return true
+	}
+	return false
 }
 
 // liveBootstrap attempts to seed an initial configuration for the cluster. See
@@ -758,7 +851,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot: %v", err)
 	}
-	if n != meta.Size {
+	if n != meta.Size && meta.Size != -1 {
 		sink.Cancel()
 		return fmt.Errorf("failed to write snapshot, size didn't match (%d != %d)", n, meta.Size)
 	}
@@ -843,6 +936,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	lastIndex := r.getLastIndex()
 	logs := make([]*Log, len(applyLogs))
 
+	startAddInflight := time.Now()
 	for idx, applyLog := range applyLogs {
 		applyLog.dispatch = now
 		lastIndex++
@@ -851,7 +945,9 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		logs[idx] = &applyLog.log
 		r.leaderState.inflight.PushBack(applyLog)
 	}
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "AddInflight"}, startAddInflight)
 
+	startStoreLog := time.Now()
 	// Write the log entry locally
 	if err := r.logs.StoreLogs(logs); err != nil {
 		r.logger.Printf("[ERR] raft: Failed to commit logs: %v", err)
@@ -861,7 +957,11 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		r.setState(Follower)
 		return
 	}
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "StoreLogs"}, startStoreLog)
+
+	startCommitmentMatch := time.Now()
 	r.leaderState.commitment.match(r.localID, lastIndex)
+	metrics.MeasureSince([]string{"raft", "leader", "dispatchLog", "child", "commitmentMatch"}, startCommitmentMatch)
 
 	// Update the last log since it's on disk now
 	r.setLastLog(lastIndex, term)
@@ -1010,17 +1110,32 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		return
 	}
 
-	// Increase the term if we see a newer one, also transition to follower
-	// if we ever get an appendEntries call
-	if a.Term > r.getCurrentTerm() || r.getState() != Follower {
-		// Ensure transition to follower
-		r.setState(Follower)
+	// Increase the term if we see a newer one
+	if a.Term > r.getCurrentTerm() {
 		r.setCurrentTerm(a.Term)
 		resp.Term = a.Term
 	}
 
-	// Save the current leader
-	r.setLeader(ServerAddress(r.trans.DecodePeer(a.Leader)))
+	// Ensure transition to follower
+	if r.getState() != Follower {
+		r.setState(Follower)
+	}
+
+	leader := r.trans.DecodePeer(a.Leader)
+	if r.Leader() != leader {
+		// Save the current leader
+		r.logger.Printf("[INFO] raft: Changing leader from %q to %q", r.Leader(), leader)
+		r.setLeader(leader)
+	}
+	// If leader got unset by appendEntries it was a shutdown signal from the
+	// leader
+	if r.Leader() == "" {
+		r.logger.Printf("[INFO] raft: Leader has shut down")
+		// Increment current term, so queued appendEntries from leader that is
+		// shutting down are ignored.
+		r.setCurrentTerm(a.Term + 1)
+		return
+	}
 
 	// Verify the last log entry
 	if a.PrevLogEntry > 0 {
@@ -1145,6 +1260,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
 	r.observe(*req)
 
+	r.receivedRequestVote = true
+
 	// Setup a response
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
@@ -1162,17 +1279,38 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		resp.Peers = encodePeers(r.configurations.latest, r.trans)
 	}
 
-	// Check if we have an existing leader [who's not the candidate]
-	candidate := r.trans.DecodePeer(req.Candidate)
-	if leader := r.Leader(); leader != "" && leader != candidate {
-		r.logger.Printf("[WARN] raft: Rejecting vote request from %v since we have a leader: %v",
-			candidate, leader)
-		return
-	}
-
 	// Ignore an older term
 	if req.Term < r.getCurrentTerm() {
 		return
+	}
+
+	candidate := r.trans.DecodePeer(req.Candidate)
+
+	// Don't accept voting requests from unknown or non voting servers if
+	// there's an active configuration with more than 0 servers. If the
+	// configuration has 0 servers this node should help bootstrapping a
+	// cluster.
+	if len(r.configurations.latest.Servers) > 0 {
+		var candidateServer *Server
+		for _, server := range r.configurations.latest.Servers {
+			if server.Address == candidate {
+				candidateServer = &server
+				break
+			}
+		}
+
+		// If the candidate is not part of the latest configuration ignore its
+		// voting request
+		if candidateServer == nil {
+			r.logger.Printf("[WARN] raft: Rejecting vote request from %v, since it'not part of the configuration", candidate)
+			return
+		}
+
+		// If the candidate is not a voter, ignore its voting request
+		if candidateServer.Suffrage != Voter {
+			r.logger.Printf("[WARN] raft: Rejecting vote request from %v, since it's a non voting server", candidate)
+			return
+		}
 	}
 
 	// Increase the term if we see a newer one
@@ -1300,7 +1438,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}
 
 	// Check that we received it all
-	if n != req.Size {
+	if req.Size != -1 && n != req.Size {
 		sink.Cancel()
 		r.logger.Printf("[ERR] raft: Failed to receive whole snapshot: %d / %d", n, req.Size)
 		rpcErr = fmt.Errorf("short read")
