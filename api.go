@@ -1054,3 +1054,28 @@ func (r *Raft) LastIndex() uint64 {
 func (r *Raft) AppliedIndex() uint64 {
 	return r.getLastApplied()
 }
+
+// PeersLostContact returns server ids of the peers that has lost contact after certain duration.
+func (r *Raft) PeersLostContact(du time.Duration) []ServerID {
+	now := time.Now()
+	var ids []ServerID
+	for peer, f := range r.leaderState.replState {
+		diff := now.Sub(f.LastContact())
+		if diff > du {
+			ids = append(ids, peer)
+		}
+	}
+	return ids
+}
+
+// LatestConfigIndex returns the latest configuration index
+func (r *Raft) LatestConfigIndex() (lastConfigIndex uint64, err error) {
+	future := r.GetConfiguration()
+	if err = future.Error(); err != nil {
+		r.logger.Printf("[WARN] raft: could not get configuration for Stats: %v", err)
+		return
+	} else {
+		lastConfigIndex = future.Index()
+	}
+	return
+}
